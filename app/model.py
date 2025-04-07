@@ -1,11 +1,12 @@
 import pandas as pd
 import numpy as np
-from sklearn.linear_model import LinearRegression
-from app.utils import encoder, encode_event
+from sklearn.ensemble import RandomForestRegressor  # 👈 swapped here
+from app.utils import encoder, encode_event, extract_time_features
 from flask import jsonify
+from datetime import datetime
 
 # Global model object
-model = LinearRegression()
+model = RandomForestRegressor(n_estimators=100, random_state=42)  # 👈 swapped here
 
 def train_model_logic(request):
     file = request.files.get('file')
@@ -19,14 +20,18 @@ def train_model_logic(request):
     else:
         return jsonify({"error": "Unsupported file format"}), 400
 
-    required_columns = {"product", "historical_sales", "current_stock", "upcoming_event"}
+    required_columns = {"product", "historical_sales", "current_stock", "upcoming_event", "order_date"}
     if not required_columns.issubset(data.columns):
-        return jsonify({"error": "Invalid file format. Required columns: product, historical_sales, current_stock, upcoming_event"}), 400
+        return jsonify({"error": "Invalid file format. Required columns: product, historical_sales, current_stock, upcoming_event, order_date"}), 400
 
     if isinstance(data['historical_sales'].iloc[0], str):
         data['historical_sales'] = data['historical_sales'].apply(lambda x: list(map(int, x.split(','))))
     elif isinstance(data['historical_sales'].iloc[0], int):
         data['historical_sales'] = data['historical_sales'].apply(lambda x: [x])
+
+    # Extract time features from order_date
+    time_features_df = data['order_date'].apply(lambda x: extract_time_features(x))
+    time_features = pd.DataFrame(time_features_df.tolist())
 
     encoder.fit(data[['upcoming_event']])
     encoded_events = encoder.transform(data[['upcoming_event']]).toarray()
@@ -35,11 +40,12 @@ def train_model_logic(request):
     for idx, row in data.iterrows():
         sales = row['historical_sales']
         for i in range(len(sales) - 1):
-            X_train.append([sales[i], row['current_stock']])
+            time_row = time_features.iloc[idx].values
+            encoded_event = encoded_events[idx]
+            X_train.append([sales[i], row['current_stock']] + list(time_row) + list(encoded_event))
             y_train.append(sales[i + 1])
 
     X_train = np.array(X_train)
-    X_train = np.hstack((X_train, encoded_events.repeat(len(sales)-1, axis=0)))
     y_train = np.array(y_train)
 
     model.fit(X_train, y_train)
@@ -51,12 +57,15 @@ def predict_sales_logic(request):
     last_sales = data.get("historical_sales")
     current_stock = data.get("current_stock", 0)
     upcoming_event = data.get("upcoming_event")
+    order_date = data.get("order_date", datetime.today().strftime('%Y-%m-%d'))
 
     if not product or not last_sales:
         return jsonify({"error": "Missing required fields"}), 400
 
     encoded_input = encode_event(upcoming_event)
-    X_test = np.hstack(([last_sales[-1], current_stock], encoded_input))
+    time_input = extract_time_features(order_date)
+    X_test = np.hstack(([last_sales[-1], current_stock], list(time_input), encoded_input))
+
     predicted_sales = model.predict([X_test])[0]
     reorder_suggestion = max(0, int(predicted_sales - current_stock))
 
@@ -64,5 +73,5 @@ def predict_sales_logic(request):
         "product": product,
         "predicted_sales_next_month": int(predicted_sales),
         "reorder_suggestion": reorder_suggestion,
-        "reasoning": "Predicted sales based on historical trends and events."
+        "reasoning": "Predicted sales based on historical trends, time features, and events."
     })
